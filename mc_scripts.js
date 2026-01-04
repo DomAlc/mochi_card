@@ -95,99 +95,78 @@ SnapExtensions.primitives.set(
 
 SnapExtensions.primitives.set(
   'mc_open(baud, buffer)',
-  function (baud, buffer, proc) {
+  function (baud, buf, proc) {
 
-    var acc = proc.context.accumulator;
+    const acc = proc.context.accumulator || (proc.context.accumulator = {
+      port: null,
+      reader: null,
+      backlog: [],
+      error: null,
+      opening: true
+    });
 
-    // filtros USB conocidos
-    const FILTERS = [
-      { usbVendorId: 0x1A86, usbProductId: 0x7523 }, // CH340
-      { usbVendorId: 0x0403, usbProductId: 0x6001 }  // FTDI
-    ];
+    if (acc.opening) {
+      acc.opening = false;
 
-    const DEFAULT_BAUD   = baud   || 115200;
-    const DEFAULT_BUFFER = buffer || 512; // suficiente para Snap + Arduino
-
-    // cierre forzado y seguro
-    async function forceClose(port) {
-      try {
-        if (!port) return;
-
-        if (port.mochi?.reader) {
-          await port.mochi.reader.cancel();
-          port.mochi.reader = null;
-        }
-
-        if (port.readable) {
-          try { await port.readable.cancel(); } catch {}
-        }
-
-        if (port.writable) {
-          try { await port.writable.abort(); } catch {}
-        }
-
-        if (port.readable || port.writable) {
-          await port.close();
-        }
-      } catch (e) {
-        console.warn('forceClose error:', e);
-      }
-    }
-
-    // inicialización async (solo una vez)
-    if (!acc) {
-      acc = proc.context.accumulator = { result: false };
-
-      (async function () {
+      (async () => {
         try {
-          // solicitar puerto al usuario
-          const port = await navigator.serial.requestPort({ filters: FILTERS });
 
-          // cerrar si estaba medio abierto
-          await forceClose(port);
+          const filters = [
+            { usbVendorId: 0x1A86, usbProductId: 0x7523 }, // CH340
+            { usbVendorId: 0x0403, usbProductId: 0x6001 }  // FTDI
+          ];
 
-          // abrir puerto
+          const port = await navigator.serial.requestPort({ filters });
+
           await port.open({
-            baudRate: DEFAULT_BAUD,
-            bufferSize: DEFAULT_BUFFER
+            baudRate: baud || 115200,
+            bufferSize: buf || 15000
           });
 
-          // estructura interna Mochi (evitar propiedades privadas)
-          port.mochi = {
-            backlog: [],
-            reader: null,
-            disconnected: false
-          };
+          acc.port = port;
+          acc.backlog = [];
 
-          // detectar desconexión física
-          port.addEventListener('disconnect', () => {
-            port.mochi.disconnected = true;
-            console.warn('Puerto serial desconectado');
-          });
+          // 🔁 LECTOR PERMANENTE
+          acc.reader = port.readable.getReader();
 
-          acc.result = port;
+          (async function readLoop() {
+            try {
+              while (true) {
+                const { value, done } = await acc.reader.read();
+                if (done) break;
+                if (value) {
+                  acc.backlog.push(...value);
+                }
+              }
+            } catch (e) {
+              acc.error = e;
+            }
+          })();
 
         } catch (e) {
-          acc.result = e;
+          acc.error = e;
         }
       })();
 
-    }
-    // resultado disponible
-    else if (acc.result !== false) {
-
-      if (acc.result instanceof Error) {
-        throw acc.result;
-      }
-
-      return acc.result;
+      proc.pushContext('doYield');
+      proc.pushContext();
+      return;
     }
 
-    // Snap: yield mientras esperamos
+    // ---- resultado ----
+    if (acc.error) {
+      throw acc.error;
+    }
+
+    if (acc.port) {
+      return acc.port;
+    }
+
     proc.pushContext('doYield');
     proc.pushContext();
   }
 );
+
 
 
 SnapExtensions.primitives.set(
