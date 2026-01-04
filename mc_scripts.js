@@ -77,7 +77,10 @@ SnapExtensions.primitives.set(
 SnapExtensions.primitives.set(
     'mc_split(textToSplit, index)',
     function (textToSplit, index ,proc) {
-      var tokensArray = textToSplit.slice(3).split(",");
+      if (textToSplit[0] !== '#') return -1;
+      var tokensArray = textToSplit.substring(2).split(',');
+      index = Number(index);
+      if (Number.isNaN(index)) return -1;
       if (index > tokensArray.length-1) {
         return -1; // error, index over array length
       } else {
@@ -89,59 +92,106 @@ SnapExtensions.primitives.set(
 SnapExtensions.primitives.set(
     'mc_isopen(port)',
     function (port, proc) {
-      return (port?.writable != null)   
+      return !!(port && port.readable && port.writable); 
     }
 );
 
 SnapExtensions.primitives.set(
-    'mc_open(baud, buffer)',
-    function (baud, buf, proc) {
-        var acc = proc.context.accumulator;
-        // define a filter for CH340 serial to USB device
-        const filter_mc2 =  { usbVendorId: 0x1A86, usbProductId: 0x7523 }; // CH340G usb to serial present int MC2
-        const filter_mc3 =  { usbVendorId: 0x0403, usbProductId: 0x6001 }; // FTDI usb to serial present int MC3
-                        
-        async function forceClose(port){
-            try {
-                if (!port?.writable) {return; } // already closed
-                // console.log("force close...", port);
-                if (port._reader) {await port._reader.cancel(); }
-                if (port?.readable) {await port.readable.cancel(); }
-                if (port?.writable) {await port.writable.abort(); }
-                if (port?.writable) {await port.close(); } // close if open
-            } catch (e) {
-                // console.log( e);
-                acc.result = e;
-            }
+  'mc_open(baud, buffer)',
+  function (baud, buffer, proc) {
+
+    var acc = proc.context.accumulator;
+
+    // filtros USB conocidos
+    const FILTERS = [
+      { usbVendorId: 0x1A86, usbProductId: 0x7523 }, // CH340
+      { usbVendorId: 0x0403, usbProductId: 0x6001 }  // FTDI
+    ];
+
+    const DEFAULT_BAUD   = baud   || 115200;
+    const DEFAULT_BUFFER = buffer || 512; // suficiente para Snap + Arduino
+
+    // cierre forzado y seguro
+    async function forceClose(port) {
+      try {
+        if (!port) return;
+
+        if (port.mochi?.reader) {
+          await port.mochi.reader.cancel();
+          port.mochi.reader = null;
         }
 
-        if (!acc) {
-            acc = proc.context.accumulator = {result: false};
-            (async function (baud) {
-                try {
-                    var port;
-                    port = await navigator.serial.requestPort({ filters: [filter_mc2, filter_mc3] });
-                    await forceClose(port);
-                    await port.open({
-                        baudRate: baud,
-                        bufferSize: buf || 15000
-                    });
-                    acc.result = port;
-                    port._bklog = [];//backlog
-                } catch(e) {
-                    acc.result = e;
-                }
-            }) (baud || 115200);
-        } else if (acc.result !== false) {
-            if (acc.result instanceof  Error) {
-                throw acc.result;
-            }
-            return acc.result;
+        if (port.readable) {
+          try { await port.readable.cancel(); } catch {}
         }
-        proc.pushContext('doYield');
-        proc.pushContext();
+
+        if (port.writable) {
+          try { await port.writable.abort(); } catch {}
+        }
+
+        if (port.readable || port.writable) {
+          await port.close();
+        }
+      } catch (e) {
+        console.warn('forceClose error:', e);
+      }
     }
+
+    // inicialización async (solo una vez)
+    if (!acc) {
+      acc = proc.context.accumulator = { result: false };
+
+      (async function () {
+        try {
+          // solicitar puerto al usuario
+          const port = await navigator.serial.requestPort({ filters: FILTERS });
+
+          // cerrar si estaba medio abierto
+          await forceClose(port);
+
+          // abrir puerto
+          await port.open({
+            baudRate: DEFAULT_BAUD,
+            bufferSize: DEFAULT_BUFFER
+          });
+
+          // estructura interna Mochi (evitar propiedades privadas)
+          port.mochi = {
+            backlog: [],
+            reader: null,
+            disconnected: false
+          };
+
+          // detectar desconexión física
+          port.addEventListener('disconnect', () => {
+            port.mochi.disconnected = true;
+            console.warn('Puerto serial desconectado');
+          });
+
+          acc.result = port;
+
+        } catch (e) {
+          acc.result = e;
+        }
+      })();
+
+    }
+    // resultado disponible
+    else if (acc.result !== false) {
+
+      if (acc.result instanceof Error) {
+        throw acc.result;
+      }
+
+      return acc.result;
+    }
+
+    // Snap: yield mientras esperamos
+    proc.pushContext('doYield');
+    proc.pushContext();
+  }
 );
+
 
 SnapExtensions.primitives.set(
   'mc_isValidFrame(frame)',
@@ -157,10 +207,286 @@ SnapExtensions.primitives.set(
 SnapExtensions.primitives.set(
   'mc_buildFrame(fun, payload)',
   function (fun, payload, proc) {
-    var frame = new List(Array.from(new TextEncoder().encode('#'+fun+payload+'\n')));
-    return frame;
+
+    // asegurar function code a 2 dígitos
+    fun = String(fun).padStart(2, '0');
+
+    // payload opcional
+    payload = payload || '';
+
+    // cuerpo SIN '#' NI '*'
+    var body = fun + payload;
+
+    // --- checksum XOR (igual que Arduino) ---
+    var checksum = 0;
+    for (let i = 0; i < body.length; i++) {
+      checksum ^= body.charCodeAt(i);
+    }
+
+    // hexadecimal 2 dígitos
+    var csHex = checksum.toString(16).toUpperCase().padStart(2, '0');
+
+    // frame final
+    var frameStr = '#' + body + '*' + csHex + '\n';
+
+    // convertir a bytes (Uint8)
+    var bytes = new TextEncoder().encode(frameStr);
+
+    // Snap espera una List de bytes
+    return new List(Array.from(bytes));
   }
 );
+
+SnapExtensions.primitives.set(
+  'mc_readFrame(port)',
+  function (port, proc) {
+
+    var acc = proc.context.accumulator;
+
+    // inicialización
+    if (!acc) {
+      acc = proc.context.accumulator = {
+        result: null,
+        busy: false
+      };
+    }
+
+    // puerto inválido o cerrado
+    if (!port || !port.readable) {
+      return null;
+    }
+
+    // inicializar reader una sola vez
+    if (!port._reader) {
+      port._reader = port.readable.getReader();
+      port._bklog = port._bklog || [];
+    }
+
+    // si ya estamos leyendo → yield
+    if (acc.busy) {
+      proc.pushContext('doYield');
+      proc.pushContext();
+      return;
+    }
+
+    acc.busy = true;
+
+    (async function () {
+      try {
+        const { value, done } = await port._reader.read();
+
+        if (done || !value) {
+          acc.result = null;
+          acc.busy = false;
+          return;
+        }
+
+        // añadir bytes al backlog
+        for (let b of value) {
+          port._bklog.push(b);
+        }
+
+        // buscar '\n'
+        let idx = port._bklog.indexOf(10); // '\n'
+
+        if (idx === -1) {
+          acc.result = null; // aún no hay frame completo
+          acc.busy = false;
+          return;
+        }
+
+        // extraer frame
+        let frameBytes = port._bklog.splice(0, idx + 1);
+        let frameStr = new TextDecoder().decode(
+          new Uint8Array(frameBytes)
+        );
+
+        // --- Validaciones ---
+        // formato mínimo: #xx*\n
+        if (frameStr[0] !== '#' || !frameStr.includes('*')) {
+          acc.result = false;
+          acc.busy = false;
+          return;
+        }
+
+        let star = frameStr.indexOf('*');
+        let body = frameStr.slice(1, star); // sin '#'
+        let csStr = frameStr.slice(star + 1, star + 3);
+
+        // checksum XOR
+        let cs = 0;
+        for (let i = 0; i < body.length; i++) {
+          cs ^= body.charCodeAt(i);
+        }
+
+        let csHex = cs.toString(16).toUpperCase().padStart(2, '0');
+
+        if (csHex !== csStr.toUpperCase()) {
+          acc.result = false; // checksum incorrecto
+        } else {
+          acc.result = frameStr; // frame válido
+        }
+
+      } catch (e) {
+        acc.result = false;
+      } finally {
+        acc.busy = false;
+      }
+    })();
+
+    proc.pushContext('doYield');
+    proc.pushContext();
+  }
+);
+
+SnapExtensions.primitives.set(
+  'mc_sendFrame(port, fun, payload)',
+  function (port, fun, payload, proc) {
+
+    var acc = proc.context.accumulator;
+
+    // inicialización
+    if (!acc) {
+      acc = proc.context.accumulator = {
+        busy: false,
+        result: false
+      };
+    }
+
+    // puerto inválido
+    if (!port || !port.writable) {
+      return false;
+    }
+
+    // evitar reentradas
+    if (acc.busy) {
+      proc.pushContext('doYield');
+      proc.pushContext();
+      return;
+    }
+
+    acc.busy = true;
+
+    (async function () {
+      try {
+        // asegurar writer persistente
+        if (!port._writer) {
+          port._writer = port.writable.getWriter();
+        }
+
+        // --- construir frame ---
+        let body = String(fun) + (payload || '');
+        let cs = 0;
+
+        for (let i = 0; i < body.length; i++) {
+          cs ^= body.charCodeAt(i);
+        }
+
+        let csHex = cs.toString(16).toUpperCase().padStart(2, '0');
+
+        let frame = '#' + body + '*' + csHex + '\n';
+
+        // --- enviar ---
+        let data = new TextEncoder().encode(frame);
+        await port._writer.write(data);
+
+        acc.result = true;
+
+      } catch (e) {
+        acc.result = false;
+      } finally {
+        acc.busy = false;
+      }
+    })();
+
+    proc.pushContext('doYield');
+    proc.pushContext();
+  }
+);
+
+SnapExtensions.primitives.set(
+  'mc_jsReady()',
+  function () {
+    return typeof navigator !== 'undefined' &&
+           navigator.serial !== undefined;
+  }
+);
+
+SnapExtensions.primitives.set(
+  'mc_connectMochi()',
+  function (proc) {
+
+    // JS Extensions desactivadas
+    if (typeof navigator === 'undefined' || !navigator.serial) {
+      throw new Error(
+        "⚠️ JavaScript Extensions desactivadas.\n\n" +
+        "Actívalas en ⚙️ → JavaScript Extensions\n" +
+        "y recarga la página."
+      );
+    }
+
+    var acc = proc.context.accumulator;
+
+    if (!acc) {
+      acc = proc.context.accumulator = {
+        result: false,
+        port: null
+      };
+
+      (async function () {
+        try {
+
+          // Intentar reutilizar puerto autorizado
+          let ports = await navigator.serial.getPorts();
+          let port = ports.length ? ports[0] : null;
+
+          //  Si no hay, pedir permiso
+          if (!port) {
+            port = await navigator.serial.requestPort({
+              filters: [
+                { usbVendorId: 0x1A86, usbProductId: 0x7523 }, // CH340
+                { usbVendorId: 0x0403, usbProductId: 0x6001 }  // FTDI
+              ]
+            });
+          }
+
+          //  Abrir puerto
+          await port.open({
+            baudRate: 115200,
+            bufferSize: 15000
+          });
+
+          //  Estado MochiCard
+          port._mc = {
+            connected: true,
+            lastSeen: Date.now(),
+            baud: 115200,
+            bufferSize: 15000,
+            reconnecting: false
+          };
+
+          acc.result = true;
+          acc.port = port;
+
+        } catch (e) {
+          acc.result = e;
+        }
+      })();
+
+    } else {
+      if (acc.result === true) {
+        return true;
+      }
+      if (acc.result instanceof Error) {
+        throw acc.result;
+      }
+    }
+
+    proc.pushContext('doYield');
+    proc.pushContext();
+  }
+);
+
 
 
 
