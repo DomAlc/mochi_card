@@ -94,79 +94,54 @@ SnapExtensions.primitives.set(
 );
 
 SnapExtensions.primitives.set(
-  'mc_open(baud, buffer)',
-  function (baud, buf, proc) {
-
-    const acc = proc.context.accumulator || (proc.context.accumulator = {
-      port: null,
-      reader: null,
-      backlog: [],
-      error: null,
-      opening: true
-    });
-
-    if (acc.opening) {
-      acc.opening = false;
-
-      (async () => {
-        try {
-
-          const filters = [
-            { usbVendorId: 0x1A86, usbProductId: 0x7523 }, // CH340
-            { usbVendorId: 0x0403, usbProductId: 0x6001 }  // FTDI
-          ];
-
-          const port = await navigator.serial.requestPort({ filters });
-
-          await port.open({
-            baudRate: baud || 115200,
-            bufferSize: buf || 15000
-          });
-
-          acc.port = port;
-          acc.backlog = [];
-
-          // 🔁 LECTOR PERMANENTE
-          acc.reader = port.readable.getReader();
-
-          (async function readLoop() {
+    'mc_open(baud, buffer)',
+    function (baud, buf, proc) {
+        var acc = proc.context.accumulator;
+        // define a filter for CH340 serial to USB device
+        const filter_mc2 =  { usbVendorId: 0x1A86, usbProductId: 0x7523 }; // CH340G usb to serial present int MC2
+        const filter_mc3 =  { usbVendorId: 0x0403, usbProductId: 0x6001 }; // FTDI usb to serial present int MC3
+                        
+        async function forceClose(port){
             try {
-              while (true) {
-                const { value, done } = await acc.reader.read();
-                if (done) break;
-                if (value) {
-                  acc.backlog.push(...value);
-                }
-              }
+                if (!port?.writable) {return; } // already closed
+                // console.log("force close...", port);
+                if (port._reader) {await port._reader.cancel(); }
+                if (port?.readable) {await port.readable.cancel(); }
+                if (port?.writable) {await port.writable.abort(); }
+                if (port?.writable) {await port.close(); } // close if open
             } catch (e) {
-              acc.error = e;
+                // console.log( e);
+                acc.result = e;
             }
-          })();
-
-        } catch (e) {
-          acc.error = e;
         }
-      })();
 
-      proc.pushContext('doYield');
-      proc.pushContext();
-      return;
+        if (!acc) {
+            acc = proc.context.accumulator = {result: false};
+            (async function (baud) {
+                try {
+                    var port;
+                    port = await navigator.serial.requestPort({ filters: [filter_mc2, filter_mc3] });
+                    await forceClose(port);
+                    await port.open({
+                        baudRate: baud,
+                        bufferSize: buf || 15000
+                    });
+                    acc.result = port;
+                    port._bklog = [];//backlog
+                } catch(e) {
+                    acc.result = e;
+                }
+            }) (baud || 115200);
+        } else if (acc.result !== false) {
+            if (acc.result instanceof  Error) {
+                throw acc.result;
+            }
+            return acc.result;
+        }
+        proc.pushContext('doYield');
+        proc.pushContext();
     }
-
-    // ---- resultado ----
-    if (acc.error) {
-      throw acc.error;
-    }
-
-    if (acc.port) {
-      return acc.port;
-    }
-
-    proc.pushContext('doYield');
-    proc.pushContext();
-  }
 );
-
 
 
 SnapExtensions.primitives.set(
