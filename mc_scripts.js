@@ -204,36 +204,11 @@ SnapExtensions.primitives.set(
   }
 );
 
-SnapExtensions.primitives.set(
+SnapExtensions.primitives.set( 
   'mc_buildFrame(fun, payload)',
-  function (fun, payload, proc) {
-
-    // asegurar function code a 2 dígitos
-    fun = String(fun).padStart(2, '0');
-
-    // payload opcional
-    payload = payload || '';
-
-    // cuerpo SIN '#' NI '*'
-    var body = fun + payload;
-
-    // --- checksum XOR (igual que Arduino) ---
-    var checksum = 0;
-    for (let i = 0; i < body.length; i++) {
-      checksum ^= body.charCodeAt(i);
-    }
-
-    // hexadecimal 2 dígitos
-    var csHex = checksum.toString(16).toUpperCase().padStart(2, '0');
-
-    // frame final
-    var frameStr = '#' + body + '*' + csHex + '\n';
-
-    // convertir a bytes (Uint8)
-    var bytes = new TextEncoder().encode(frameStr);
-
-    // Snap espera una List de bytes
-    return new List(Array.from(bytes));
+  function (fun, payload, proc) { 
+    var frame = new List(Array.from(new TextEncoder().encode('#'+fun+payload+'\n')));
+    return frame; 
   }
 );
 
